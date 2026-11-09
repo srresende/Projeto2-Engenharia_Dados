@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Saída gerada por scripts/tratar_pedidos_vendas.py (reproduzível)
+data/Planilha_pedidos_vendas_tratada.xlsx
