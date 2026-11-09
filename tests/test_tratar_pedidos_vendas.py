@@ -262,8 +262,13 @@ class TestPontaAPonta:
     # --- estrutura e preservação da origem ----------------------------------
     def test_abas(self, execucao):
         wb = openpyxl.load_workbook(execucao["saida"], read_only=True)
-        assert wb.sheetnames == ["pedidos_tratados", "pedidos_validos",
-                                 "log_alteracoes", "metadados", "original"]
+        assert wb.sheetnames == ["pedidos_tratados", "pedidos_validos", "log_alteracoes",
+                                 "resumo_qualidade", "validacoes", "metadados", "original"]
+
+    def test_validacoes_aprovadas_na_planilha(self, execucao):
+        validacoes = pd.read_excel(execucao["saida"], "validacoes")
+        reprovadas = validacoes[~validacoes["aprovado"]]
+        assert reprovadas.empty, reprovadas.to_string()
 
     def test_origem_nao_foi_alterada(self, execucao):
         assert sha256(ORIGEM) == execucao["hash_antes"]

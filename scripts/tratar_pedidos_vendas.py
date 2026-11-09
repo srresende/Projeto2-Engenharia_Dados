@@ -1,14 +1,16 @@
 """
 Tratamento da planilha de pedidos de vendas.
 
-Lê data/Planilha_pedidos_vendas.xlsx (sem alterá-la) e gera
-data/Planilha_pedidos_vendas_tratada.xlsx com as abas:
+Lê a planilha de origem (.xlsx ou .csv, sem alterá-la) e gera uma planilha
+tratada (.xlsx) com as abas:
 
     pedidos_tratados  todas as linhas corrigidas + colunas de controle
     pedidos_validos   igual à anterior, sem as duplicatas confirmadas
     log_alteracoes    cada célula alterada: valor original, valor novo e regra
+    resumo_qualidade  erros encontrados e melhorias aplicadas por categoria
+    validacoes        verificações automáticas do resultado (scripts/validacoes.py)
     metadados         arquivo de origem, hash SHA-256, data de processamento, contagens
-    original          cópia fiel da aba de origem (linhagem dos dados)
+    original          cópia fiel dos dados de origem (linhagem)
 
 Correções aplicadas:
     1. Receita em texto ("R$ 4320.00") -> número; receitas vazias sinalizadas
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import re
 import shutil
 import unicodedata
@@ -78,6 +81,11 @@ FLAGS_OBSERVACAO = {
     "sem representante": "flag_sem_representante",
 }
 PARTICULAS = {"da", "de", "do", "das", "dos", "e"}
+CODIFICACOES_CSV = ("utf-8-sig", "cp1252", "latin-1")
+SEPARADORES_CSV = (";", ",", "\t", "|")
+
+REGRA_TIPO_NUMERO = "conversão de tipo: texto -> número"
+REGRA_TIPO_DATA = "conversão de tipo: texto -> data"
 
 ORDEM_SAIDA = [
     "id_pedido", "data_pedido", "cliente", "regiao", "representante", "produto",
@@ -141,13 +149,49 @@ class Log:
         return pd.DataFrame(self.registros, columns=cols)
 
 
-def aplicar(df: pd.DataFrame, coluna: str, func, regra: str, log: Log) -> None:
-    """Aplica func à coluna, registrando no log apenas as células que mudaram."""
+def aplicar(df: pd.DataFrame, coluna: str, func, regra, log: Log) -> None:
+    """Aplica func à coluna, registrando no log apenas as células que mudaram.
+    `regra` pode ser texto fixo ou função (valor_original -> texto)."""
     novos = df[coluna].map(func)
     for idx in df.index:
-        if mudou(df.at[idx, coluna], novos.at[idx]):
-            log.add(df, idx, coluna, df.at[idx, coluna], novos.at[idx], regra)
+        antes, depois = df.at[idx, coluna], novos.at[idx]
+        if mudou(antes, depois):
+            log.add(df, idx, coluna, antes, depois, regra(antes) if callable(regra) else regra)
     df[coluna] = novos
+
+
+# --------------------------------------------------------------------------- leitura
+def ler_arquivo(conteudo: bytes, nome: str) -> pd.DataFrame:
+    """Lê .csv (codificação e separador detectados) ou .xlsx, mantendo os valores brutos."""
+    if not conteudo or not conteudo.strip():
+        raise ValueError("O arquivo está vazio.")
+    sufixo = Path(nome).suffix.lower()
+    if sufixo in (".xlsx", ".xlsm"):
+        return pd.read_excel(io.BytesIO(conteudo), sheet_name=0, dtype=object)
+    if sufixo not in (".csv", ".txt"):
+        raise ValueError(f"Formato não suportado: {sufixo or 'sem extensão'}. Envie um arquivo .csv.")
+
+    for codificacao in CODIFICACOES_CSV:
+        try:
+            texto = conteudo.decode(codificacao)
+            break
+        except UnicodeDecodeError:
+            continue
+    cabecalho = texto.lstrip().splitlines()[0]
+    separador = max(SEPARADORES_CSV, key=cabecalho.count)
+    df = pd.read_csv(io.StringIO(texto), sep=separador, dtype=object)
+    df.columns = [str(c).strip() for c in df.columns]
+    # Linhas totalmente vazias são descartadas; o índice original é mantido
+    # para que linha_origem continue apontando para a linha do arquivo.
+    return df.dropna(how="all")
+
+
+def normalizar_colunas(bruto: pd.DataFrame) -> pd.DataFrame:
+    """Reconhece cabeçalhos com variação de acento/caixa/espaço ou já em snake_case."""
+    por_chave = {chave(c): c for c in COLUNAS}
+    por_chave.update({chave(s): c for c, s in COLUNAS.items()})
+    renome = {c: por_chave[chave(c)] for c in bruto.columns if chave(c) in por_chave}
+    return bruto.rename(columns=renome)
 
 
 # --------------------------------------------------------------------------- conversores
@@ -180,7 +224,7 @@ def para_numero(v):
     if isinstance(v, (int, float)):
         return float(v)
     s = re.sub(r"[^\d,.\-]", "", str(v))
-    if not s:
+    if not s or not re.search(r"\d", s):
         return float("nan")
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):          # 4.320,00 (BR)
@@ -191,7 +235,10 @@ def para_numero(v):
         s = s.replace(",", ".")
     elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):    # 4.320 (milhar BR)
         s = s.replace(".", "")
-    return float(s)
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
 
 
 def para_data(v):
@@ -203,11 +250,36 @@ def para_data(v):
         return pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(v))
     s = str(v).strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", s):
-        return pd.to_datetime(s, errors="coerce")
+        return pd.to_datetime(s, errors="coerce").normalize()
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 
+def regra_receita(antes) -> str:
+    if isinstance(antes, str) and re.fullmatch(r"\s*-?\d+([.,]\d+)?\s*", antes):
+        return REGRA_TIPO_NUMERO
+    return "receita convertida de texto para número"
+
+
+def regra_data(antes) -> str:
+    if isinstance(antes, str):
+        if re.fullmatch(r"\s*\d{4}-\d{2}-\d{2}\s*", antes):
+            return REGRA_TIPO_DATA
+        return "data em formato fora do padrão convertida"
+    if isinstance(antes, (datetime, pd.Timestamp)):
+        return "data normalizada (hora removida)"
+    return "data convertida para tipo data"
+
+
 # --------------------------------------------------------------------------- etapas
+def converter_ids(serie: pd.Series) -> pd.Series:
+    """IDs numéricos inteiros viram Int64; caso contrário são mantidos como texto."""
+    preenchidos = serie.map(lambda v: not vazio(v))
+    numeros = pd.to_numeric(serie, errors="coerce")
+    if numeros.notna().sum() == preenchidos.sum() and (numeros.dropna() % 1 == 0).all():
+        return numeros.astype("Int64")
+    return serie.map(lambda v: pd.NA if vazio(v) else str(v).strip())
+
+
 def tratar_observacoes(df: pd.DataFrame, log: Log) -> None:
     """Move status digitado em Observações e converte avisos em flags."""
     for col in set(FLAGS_OBSERVACAO.values()):
@@ -243,9 +315,9 @@ def inferir_ausentes(df: pd.DataFrame, log: Log) -> None:
     regiao_por_rep = mapa_unico(df, "representante", "regiao")
     for idx in df.index[df["regiao"].isna()]:
         cliente, rep = df.at[idx, "cliente"], df.at[idx, "representante"]
-        if cliente in regiao_por_cliente:
+        if not vazio(cliente) and cliente in regiao_por_cliente:
             novo, regra = regiao_por_cliente[cliente], "região inferida por outro pedido do mesmo cliente"
-        elif rep in regiao_por_rep:
+        elif not vazio(rep) and rep in regiao_por_rep:
             novo, regra = regiao_por_rep[rep], "região inferida pelo representante (atende uma única região)"
         else:
             continue
@@ -257,9 +329,9 @@ def inferir_ausentes(df: pd.DataFrame, log: Log) -> None:
     rep_por_regiao = mapa_unico(df, "regiao", "representante")
     for idx in df.index[df["representante"].isna()]:
         cliente, regiao = df.at[idx, "cliente"], df.at[idx, "regiao"]
-        if cliente in rep_por_cliente:
+        if not vazio(cliente) and cliente in rep_por_cliente:
             novo, regra = rep_por_cliente[cliente], "representante inferido por outro pedido do mesmo cliente"
-        elif regiao in rep_por_regiao:
+        elif not vazio(regiao) and regiao in rep_por_regiao:
             novo, regra = rep_por_regiao[regiao], "representante inferido pela região (único representante)"
         else:
             continue
@@ -275,7 +347,7 @@ def marcar_duplicatas(df: pd.DataFrame, log: Log) -> None:
     coincidem; caso contrário 'possivel_duplicado' (decisão da área de negócio).
     """
     df["status_registro"] = "ativo"
-    df["duplicado_de"] = pd.array([pd.NA] * len(df), dtype="Int64")
+    df["duplicado_de"] = pd.Series([pd.NA] * len(df), index=df.index, dtype=df["id_pedido"].dtype)
     comparar = ["data_pedido", "regiao", "representante", "status"]
 
     for _, grupo in df.groupby(["cliente", "produto", "receita"], dropna=True):
@@ -302,6 +374,12 @@ def marcar_duplicatas(df: pd.DataFrame, log: Log) -> None:
 def montar_pendencias(df: pd.DataFrame) -> None:
     def pend(r) -> str:
         itens = []
+        if vazio(r["id_pedido"]):
+            itens.append("id do pedido ausente ou inválido")
+        if vazio(r["cliente"]):
+            itens.append("cliente ausente")
+        if vazio(r["produto"]):
+            itens.append("produto ausente")
         if vazio(r["receita"]):
             itens.append("receita ausente: confirmar valor")
         if r["status_registro"] == "possivel_duplicado":
@@ -326,15 +404,18 @@ def montar_pendencias(df: pd.DataFrame) -> None:
 
 # --------------------------------------------------------------------------- pipeline
 def tratar(bruto: pd.DataFrame, nome_arquivo: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    faltando = set(COLUNAS) - set(bruto.columns)
+    bruto = normalizar_colunas(bruto)
+    faltando = [c for c in COLUNAS if c not in bruto.columns]
     if faltando:
-        raise ValueError(f"Colunas esperadas não encontradas: {sorted(faltando)}")
+        raise ValueError(f"Colunas esperadas não encontradas: {faltando}")
+    if bruto.empty:
+        raise ValueError("O arquivo não tem linhas de dados.")
 
-    df = bruto.rename(columns=COLUNAS).copy()
-    df["linha_origem"] = df.index + 2            # +1 cabeçalho, +1 base 1 do Excel
+    df = bruto.rename(columns=COLUNAS)[list(COLUNAS.values())].copy()
+    df["linha_origem"] = df.index + 2            # +1 cabeçalho, +1 base 1
     df["arquivo_origem"] = nome_arquivo
     df["observacoes_original"] = df["observacoes"]
-    df["id_pedido"] = pd.to_numeric(df["id_pedido"], errors="coerce").astype("Int64")
+    df["id_pedido"] = converter_ids(df["id_pedido"])
     log = Log()
 
     aplicar(df, "cliente", nome_proprio, "nome padronizado (caixa)", log)
@@ -342,10 +423,12 @@ def tratar(bruto: pd.DataFrame, nome_arquivo: str) -> tuple[pd.DataFrame, pd.Dat
     aplicar(df, "regiao", padronizar_regiao, "região padronizada (domínio)", log)
     aplicar(df, "produto", lambda v: pd.NA if vazio(v) else str(v).strip(), "espaços removidos", log)
     aplicar(df, "status", padronizar_status, "status padronizado (domínio)", log)
-    aplicar(df, "receita", para_numero, "receita convertida de texto para número", log)
-    aplicar(df, "data_pedido", para_data, "data convertida para tipo data", log)
+    aplicar(df, "receita", para_numero, regra_receita, log)
+    aplicar(df, "data_pedido", para_data, regra_data, log)
+    aplicar(df, "observacoes", lambda v: pd.NA if vazio(v) else str(v).strip(), "espaços removidos", log)
 
     tratar_observacoes(df, log)
+    df["receita"] = df["receita"].astype(float)
     df["flag_receita_ausente"] = df["flag_receita_ausente"] | df["receita"].isna()
     df["flag_sem_representante"] = df["flag_sem_representante"] | df["representante"].isna()
 
@@ -354,24 +437,14 @@ def tratar(bruto: pd.DataFrame, nome_arquivo: str) -> tuple[pd.DataFrame, pd.Dat
     montar_pendencias(df)
 
     df["data_pedido"] = pd.to_datetime(df["data_pedido"])
-    df = df.sort_values("id_pedido").reset_index(drop=True)
+    df = df.sort_values("id_pedido", na_position="last").reset_index(drop=True)
     return df[ORDEM_SAIDA], log.to_frame()
 
 
-def formatar(ws, df: pd.DataFrame) -> None:
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for i, col in enumerate(df.columns, start=1):
-        letra = ws.cell(row=1, column=i).column_letter
-        largura = max([len(str(col))] + [len(str(v)) for v in df[col].head(200)])
-        ws.column_dimensions[letra].width = min(largura + 2, 50)
-        formato = {"receita": '"R$" #,##0.00', "data_pedido": "yyyy-mm-dd"}.get(col)
-        if formato:
-            for c in ws[letra][1:]:
-                c.number_format = formato
-
-
+# --------------------------------------------------------------------------- CLI
 def main() -> None:
+    import exportacao  # import tardio: exportacao depende deste módulo
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--entrada", type=Path, default=ENTRADA_PADRAO)
     ap.add_argument("--saida", type=Path, default=SAIDA_PADRAO)
@@ -381,54 +454,28 @@ def main() -> None:
     if entrada == saida:
         raise SystemExit("A saída não pode sobrescrever o arquivo de origem.")
 
-    xls = pd.ExcelFile(entrada, engine="openpyxl")
-    aba_origem = xls.sheet_names[0]
-    bruto = pd.read_excel(xls, sheet_name=aba_origem, dtype=object)
-    xls.close()
-
+    bruto = ler_arquivo(entrada.read_bytes(), entrada.name)
     tratados, log = tratar(bruto, entrada.name)
-    validos = tratados[tratados["status_registro"] != "duplicado_confirmado"]
+    abas = exportacao.montar_abas(bruto, tratados, log, entrada.name, sha256(entrada))
 
-    ganho = validos["status"] == "Fechado Ganho"
-    metadados = pd.DataFrame([
-        ("arquivo_origem", entrada.name),
-        ("aba_origem", aba_origem),
-        ("sha256_origem", sha256(entrada)),
-        ("processado_em", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("script", Path(__file__).name),
-        ("linhas_origem", len(bruto)),
-        ("linhas_validas", len(validos)),
-        ("duplicados_confirmados", int((tratados["status_registro"] == "duplicado_confirmado").sum())),
-        ("possiveis_duplicados", int((tratados["status_registro"] == "possivel_duplicado").sum())),
-        ("receitas_ausentes", int(tratados["receita"].isna().sum())),
-        ("celulas_alteradas", len(log)),
-        ("receita_fechado_ganho_validos", float(validos.loc[ganho, "receita"].sum())),
-    ] + [(f"regra: {r}", n) for r, n in log["regra"].value_counts().items()],
-        columns=["chave", "valor"])
-
-    # Copia o arquivo de origem e acrescenta as abas tratadas: a aba original mantém
-    # os valores e formatos de célula da origem, garantindo a linhagem dos dados.
-    # (Elementos gráficos/comentários do arquivo podem não ser preservados pelo openpyxl.)
     saida.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(entrada, saida)
-    with pd.ExcelWriter(saida, engine="openpyxl", mode="a", if_sheet_exists="replace",
-                        datetime_format="YYYY-MM-DD", date_format="YYYY-MM-DD") as w:
-        w.book[aba_origem].title = "original"
-        abas = {
-            "pedidos_tratados": tratados,
-            "pedidos_validos": validos,
-            "log_alteracoes": log,
-            "metadados": metadados,
-        }
-        for nome, dados in abas.items():
-            dados.to_excel(w, sheet_name=nome, index=False)
-            formatar(w.book[nome], dados)
-        w.book.move_sheet("original", offset=len(w.book.sheetnames) - 1)
-        w.book.active = 0
+    if entrada.suffix.lower() in (".xlsx", ".xlsm"):
+        # Copia o arquivo de origem e acrescenta as abas tratadas: a aba original mantém
+        # os valores e formatos de célula da origem, garantindo a linhagem dos dados.
+        # (Elementos gráficos/comentários do arquivo podem não ser preservados pelo openpyxl.)
+        aba_origem = pd.ExcelFile(entrada, engine="openpyxl").sheet_names[0]
+        shutil.copy2(entrada, saida)
+        with pd.ExcelWriter(saida, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
+            w.book[aba_origem].title = "original"
+            exportacao.escrever_abas(w, abas)
+            w.book.move_sheet("original", offset=len(w.book.sheetnames) - 1)
+            w.book.active = 0
+    else:
+        saida.write_bytes(exportacao.gerar_excel(abas, bruto))
 
     print(f"Origem   : {entrada}")
     print(f"Saída    : {saida}")
-    print(metadados.to_string(index=False))
+    print(abas["metadados"].to_string(index=False))
 
 
 if __name__ == "__main__":
